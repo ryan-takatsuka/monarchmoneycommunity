@@ -738,8 +738,8 @@ class MonarchMoney(object):
     async def request_accounts_refresh_and_wait(
         self,
         account_ids: Optional[List[str]] = None,
-        timeout: int = TIMEOUT,
-        delay: int = DELAY,
+        timeout: int = DEFAULT_TIMEOUT_SECS,
+        delay: int = DEFAULT_DELAY_SECS,
     ) -> bool:
         """
         Convenience method for forcing an accounts refresh on Monarch, as well
@@ -2660,8 +2660,8 @@ class MonarchMoney(object):
         self,
         account_id: str,
         csv_content: List[BalanceHistoryRow],
-        timeout: int = TIMEOUT,
-        delay: int = DELAY,
+        timeout: int = DEFAULT_TIMEOUT_SECS,
+        delay: int = DEFAULT_DELAY_SECS,
     ) -> bool:
         """
         Uploads the account balance history CSV for a specified account.
