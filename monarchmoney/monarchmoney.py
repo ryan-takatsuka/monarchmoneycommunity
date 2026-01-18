@@ -1,16 +1,18 @@
 import asyncio
 import calendar
+import csv
 import getpass
 import json
 import os
 import pickle
 import time
+from dataclasses import dataclass
+from io import StringIO
 from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Union
 
 import oathtool
 from aiohttp import ClientSession, FormData
-from aiohttp.client import DEFAULT_TIMEOUT
 from gql import Client, gql
 from gql.transport.aiohttp import AIOHTTPTransport
 from graphql import DocumentNode
@@ -18,9 +20,18 @@ from graphql import DocumentNode
 AUTH_HEADER_KEY = "authorization"
 CSRF_KEY = "csrftoken"
 DEFAULT_RECORD_LIMIT = 100
+DEFAULT_DELAY_SECS = 10
 ERRORS_KEY = "error_code"
 SESSION_DIR = ".mm"
 SESSION_FILE = f"{SESSION_DIR}/mm_session.pickle"
+DEFAULT_TIMEOUT_SECS = 300
+
+
+@dataclass
+class BalanceHistoryRow:
+    date: datetime
+    amount: float
+    account_name: Optional[str] = None
 
 
 class MonarchMoneyEndpoints(object):
@@ -143,6 +154,23 @@ class MonarchMoney(object):
         """
         await self._multi_factor_authenticate(email, password, code, trusted_device)
 
+    async def _upload_form_data(self, url: str, data: FormData) -> dict:
+        """
+        Retrieves the response from the server for a given URL and form data.
+        """
+
+        # Remove Accept and Content-Type headers because the Monarch upload endpoint
+        # rejects these values and returns an "Unsupported Media Type" error.
+        headers = self._headers.copy()
+        headers.pop("Accept", None)
+        headers.pop("Content-Type", None)
+
+        async with ClientSession(headers=headers) as session:
+            resp = await session.post(url, data=data)
+            if resp.status != 200:
+                raise RequestFailedException(f"HTTP Code {resp.status}: {resp.reason}")
+
+            return await resp.json()
 
     async def get_accounts(self) -> Dict[str, Any]:
         """
@@ -714,8 +742,8 @@ class MonarchMoney(object):
     async def request_accounts_refresh_and_wait(
         self,
         account_ids: Optional[List[str]] = None,
-        timeout: int = 300,
-        delay: int = 10,
+        timeout: int = DEFAULT_TIMEOUT_SECS,
+        delay: int = DEFAULT_DELAY_SECS,
     ) -> bool:
         """
         Convenience method for forcing an accounts refresh on Monarch, as well
@@ -2633,29 +2661,119 @@ class MonarchMoney(object):
         )
 
     async def upload_account_balance_history(
-        self, account_id: str, csv_content: str
-    ) -> None:
+        self,
+        account_id: str,
+        csv_content: List[BalanceHistoryRow],
+        timeout: int = DEFAULT_TIMEOUT_SECS,
+        delay: int = DEFAULT_DELAY_SECS,
+    ) -> bool:
         """
-        Uploads the account balance history csv for a given account.
+        Uploads the account balance history CSV for a specified account.
 
         :param account_id: The account ID to apply the history to.
         :param csv_content: CSV representation of the balance history.
+                            Headers: Date, Amount, and Account Name.
+        :param timeout: The number of seconds to wait before timing out
+        :param delay: The number of seconds to wait for each check on whether parsing is completed
         """
         if not account_id or not csv_content:
             raise RequestFailedException("account_id and csv_content cannot be empty")
 
+        csv_string = self._convert_to_csv_string(csv_content)
+
         filename = "upload.csv"
         form = FormData()
-        form.add_field("files", csv_content, filename=filename, content_type="text/csv")
+        form.add_field("files", csv_string, filename=filename, content_type="text/csv")
         form.add_field("account_files_mapping", json.dumps({filename: account_id}))
 
-        async with ClientSession(headers=self._headers) as session:
-            resp = await session.post(
-                MonarchMoneyEndpoints.getAccountBalanceHistoryUploadEndpoint(),
-                json=form,
-            )
-            if resp.status != 200:
-                raise RequestFailedException(f"HTTP Code {resp.status}: {resp.reason}")
+        upload_response = await self._upload_form_data(
+            url=MonarchMoneyEndpoints.getAccountBalanceHistoryUploadEndpoint(),
+            data=form,
+        )
+
+        session_key = upload_response["session_key"]
+
+        parse_response = await self._initiate_upload_balance_history_session(
+            session_key=session_key
+        )
+
+        is_completed = (
+            parse_response["parseBalanceHistory"]["uploadBalanceHistorySession"][
+                "status"
+            ]
+            == "completed"
+        )
+
+        start = time.time()
+        while not is_completed and (time.time() <= (start + timeout)):
+            await asyncio.sleep(delay)
+
+            is_completed = (
+                await self._is_upload_balance_history_complete(session_key)
+            )["uploadBalanceHistorySession"]["status"] == "completed"
+
+        return is_completed
+
+    async def _initiate_upload_balance_history_session(self, session_key: str) -> dict:
+        """
+        Triggers parsing of the uploaded balance history CSV file.
+
+        :param session_key: The session key for the uploaded file.
+        """
+
+        query = gql(
+            """
+            mutation Web_ParseUploadBalanceHistorySession($input: ParseBalanceHistoryInput!) {
+                parseBalanceHistory(input: $input) {
+                    uploadBalanceHistorySession {
+                        ...UploadBalanceHistorySessionFields
+                        __typename
+                    }
+                    __typename
+                }
+            }
+            fragment UploadBalanceHistorySessionFields on UploadBalanceHistorySession {
+                sessionKey
+                status
+                __typename
+            }
+            """
+        )
+
+        variables = {"input": {"sessionKey": session_key}}
+
+        return await self.gql_call(
+            "Web_ParseUploadBalanceHistorySession", query, variables
+        )
+
+    async def _is_upload_balance_history_complete(self, session_key: str):
+        """
+        Retrieves the status of the upload balance history session.
+
+        :param session_key: The session key for the uploaded file.
+        """
+
+        query = gql(
+            """
+            query Web_GetUploadBalanceHistorySession($sessionKey: String!) {
+                uploadBalanceHistorySession(sessionKey: $sessionKey) {
+                    ...UploadBalanceHistorySessionFields
+                    __typename
+                }
+            }
+            fragment UploadBalanceHistorySessionFields on UploadBalanceHistorySession {
+                sessionKey
+                status
+                __typename
+            }
+            """
+        )
+
+        variables = {"sessionKey": session_key}
+
+        return await self.gql_call(
+            "Web_GetUploadBalanceHistorySession", query, variables
+        )
 
     async def get_recurring_transactions(
         self,
@@ -2783,7 +2901,6 @@ class MonarchMoney(object):
         with open(filename, "wb") as fh:
             pickle.dump(session_data, fh)
 
-
     def load_session(self, filename: Optional[str] = None) -> None:
         """
         Loads pre-existing auth token from a Python pickle file.
@@ -2807,64 +2924,64 @@ class MonarchMoney(object):
             os.remove(filename)
 
     async def _login_user(
-      self, email: str, password: str, mfa_secret_key: Optional[str]
+        self, email: str, password: str, mfa_secret_key: Optional[str]
     ) -> None:
-      """
-      Performs the initial login to a Monarch Money account.
-      Requires/persists only the long-lived login token (NOT the 1-hour features JWT).
-      """
-      data = {
-          "password": password,
-          "supports_mfa": True,
-          "trusted_device": True,
-          "username": email,
-      }
-      if mfa_secret_key:
-          data["totp"] = oathtool.generate_otp(mfa_secret_key)
+        """
+        Performs the initial login to a Monarch Money account.
+        Requires/persists only the long-lived login token (NOT the 1-hour features JWT).
+        """
+        data = {
+            "password": password,
+            "supports_mfa": True,
+            "trusted_device": True,
+            "username": email,
+        }
+        if mfa_secret_key:
+            data["totp"] = oathtool.generate_otp(mfa_secret_key)
 
-      async with ClientSession(headers=self._headers) as session:
-          async with session.post(
-              MonarchMoneyEndpoints.getLoginEndpoint(), json=data
-          ) as resp:
-              if resp.status == 403:
-                  # Server demands MFA
-                  raise RequireMFAException("Multi-Factor Auth Required")
-              if resp.status != 200:
-                  # Surface server message if present
-                  try:
-                      response = await resp.json()
-                      if "detail" in response:
-                          raise LoginFailedException(response["detail"])
-                      if "error_code" in response:
-                          raise LoginFailedException(response["error_code"])
-                      raise LoginFailedException(f"Unrecognized error: {response}")
-                  except Exception:
-                      raise LoginFailedException(
-                          f"HTTP Code {resp.status}: {resp.reason}"
-                      )
+        async with ClientSession(headers=self._headers) as session:
+            async with session.post(
+                MonarchMoneyEndpoints.getLoginEndpoint(), json=data
+            ) as resp:
+                if resp.status == 403:
+                    # Server demands MFA
+                    raise RequireMFAException("Multi-Factor Auth Required")
+                if resp.status != 200:
+                    # Surface server message if present
+                    try:
+                        response = await resp.json()
+                        if "detail" in response:
+                            raise LoginFailedException(response["detail"])
+                        if "error_code" in response:
+                            raise LoginFailedException(response["error_code"])
+                        raise LoginFailedException(f"Unrecognized error: {response}")
+                    except Exception:
+                        raise LoginFailedException(
+                            f"HTTP Code {resp.status}: {resp.reason}"
+                        )
 
-              response = await resp.json()
-              tok = response.get("token")
-              tokexp = response.get("tokenExpiration")
+                response = await resp.json()
+                tok = response.get("token")
+                tokexp = response.get("tokenExpiration")
 
-              if not tok:
-                  raise LoginFailedException("Login succeeded but no token returned.")
-              # Reject 1-hour features/Ably JWTs (they look like header.payload.signature)
-              if isinstance(tok, str) and tok.count(".") == 2:
-                  raise LoginFailedException(
-                      "Received a JWT-style token (likely 1-hour features token). "
-                      "Refusing to save; ensure we are using /auth/login/ token."
-                  )
-              # Long-lived browser-style sessions come with tokenExpiration == null
-              if tokexp not in (None, "null"):
-                  raise LoginFailedException(
-                      f"Short-lived token returned (tokenExpiration={tokexp}). "
-                      "Retry with trusted_device=True or complete MFA as trusted device."
-                  )
+                if not tok:
+                    raise LoginFailedException("Login succeeded but no token returned.")
+                # Reject 1-hour features/Ably JWTs (they look like header.payload.signature)
+                if isinstance(tok, str) and tok.count(".") == 2:
+                    raise LoginFailedException(
+                        "Received a JWT-style token (likely 1-hour features token). "
+                        "Refusing to save; ensure we are using /auth/login/ token."
+                    )
+                # Long-lived browser-style sessions come with tokenExpiration == null
+                if tokexp not in (None, "null"):
+                    raise LoginFailedException(
+                        f"Short-lived token returned (tokenExpiration={tokexp}). "
+                        "Retry with trusted_device=True or complete MFA as trusted device."
+                    )
 
-              self.set_token(tok)
-              self._headers["Authorization"] = f"Token {self._token}"
-        
+                self.set_token(tok)
+                self._headers["Authorization"] = f"Token {self._token}"
+
     async def _multi_factor_authenticate(
         self,
         email: str,
@@ -2944,3 +3061,23 @@ class MonarchMoney(object):
             fetch_schema_from_transport=False,
             execute_timeout=self._timeout,
         )
+
+    def _convert_to_csv_string(self, csv_content: List[BalanceHistoryRow]) -> str:
+        """
+        Converts a list of BalanceHistoryRow to CSV string
+        :param csv_content: A list of BalanceHistoryRow to upload to the account balance
+        """
+
+        if not csv_content:
+            return ""
+
+        csv_string = StringIO()
+        writer = csv.writer(csv_string)
+        writer.writerow(["Date", "Amount", "Account Name"])
+
+        for row in csv_content:
+            writer.writerow(
+                [row.date.strftime("%Y-%m-%d"), row.amount, row.account_name]
+            )
+
+        return csv_string.getvalue()
