@@ -9,6 +9,7 @@ import os
 import sys
 import pickle
 import time
+import uuid
 from dataclasses import dataclass
 from io import StringIO
 from datetime import datetime, date, timedelta
@@ -94,11 +95,14 @@ class MonarchMoney(object):
         session_file: str = SESSION_FILE,
         timeout: int = 10,
         token: Optional[str] = None,
+        device_id: Optional[str] = None,
     ) -> None:
+        self._device_id = device_id or str(uuid.uuid4())
         self._headers = {
             "Accept": "application/json",
             "Client-Platform": "web",
             "Content-Type": "application/json",
+            "Device-UUID": self._device_id,
             "User-Agent": "MonarchMoneyAPI (https://github.com/bradleyseanf/monarchmoneycommunity)",
         }
         if token:
@@ -133,6 +137,11 @@ class MonarchMoney(object):
 
     def set_token(self, token: str) -> None:
         self._token = token
+
+    @property
+    def device_id(self) -> str:
+        """The Device-UUID sent with all API requests."""
+        return self._device_id
 
     async def interactive_login(
         self, use_saved_session: bool = True, save_session: bool = True
@@ -3204,7 +3213,7 @@ class MonarchMoney(object):
                 "features token, not the long-lived login session token."
             )
 
-        session_data = {"token": self._token}
+        session_data = {"token": self._token, "device_id": self._device_id}
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         with open(filename, "wb") as fh:
             pickle.dump(session_data, fh)
@@ -3220,6 +3229,9 @@ class MonarchMoney(object):
             data = pickle.load(fh)
             self.set_token(data["token"])
             self._headers["Authorization"] = f"Token {self._token}"
+            if "device_id" in data:
+                self._device_id = data["device_id"]
+                self._headers["Device-UUID"] = self._device_id
 
     def delete_session(self, filename: Optional[str] = None) -> None:
         """
@@ -3252,7 +3264,18 @@ class MonarchMoney(object):
                 MonarchMoneyEndpoints.getLoginEndpoint(), json=data
             ) as resp:
                 if resp.status == 403:
-                    # Server demands MFA
+                    # Try to surface the actual error from the API
+                    try:
+                        response = await resp.json()
+                        detail = response.get("detail", "")
+                        error_code = response.get("error_code", "")
+                        if error_code == "EMAIL_OTP_REQUIRED" or "update" in detail.lower():
+                            raise LoginFailedException(detail)
+                    except (LoginFailedException, json.JSONDecodeError):
+                        raise
+                    except Exception:
+                        pass
+                    # Default: server demands MFA
                     raise RequireMFAException("Multi-Factor Auth Required")
                 if resp.status != 200:
                     # Surface server message if present
@@ -3263,6 +3286,8 @@ class MonarchMoney(object):
                         if "error_code" in response:
                             raise LoginFailedException(response["error_code"])
                         raise LoginFailedException(f"Unrecognized error: {response}")
+                    except (LoginFailedException, json.JSONDecodeError):
+                        raise
                     except Exception:
                         raise LoginFailedException(
                             f"HTTP Code {resp.status}: {resp.reason}"
